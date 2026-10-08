@@ -381,8 +381,7 @@ async def process_buy(callback: types.CallbackQuery):
         )
     except Exception:
         pass
-
-# ----------------- ADMIN PANEL -----------------
+        # ----------------- ADMIN PANEL -----------------
 @dp.message(F.text == "⚙️ Admin Panel")
 async def open_admin_panel(message: types.Message, state: FSMContext):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -508,8 +507,8 @@ async def process_del_shop_item(callback: types.CallbackQuery):
         return
     item_id = int(callback.data.split(":")[1])
     async with aiosqlite.connect(DB_PATH) as db:
-    await db.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
-    await db.commit()
+        await db.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
+        await db.commit()
     await callback.answer("Mahsulot o'chirildi!")
     await list_shop_delete(callback)
 
@@ -777,7 +776,7 @@ async def show_stats(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# ----------------- ISHGA TUSHIRISH (RENDER PORT UCHUN) -----------------
+# ----------------- ISHGA TUSHIRISH (RENDER PORTGA MOS) -----------------
 async def start_bot_background(app):
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
