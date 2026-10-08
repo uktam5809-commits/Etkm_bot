@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -8,6 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import aiosqlite
+from aiohttp import web
 
 # ----------------- ASOSIY SOZLAMALAR -----------------
 BOT_TOKEN = "8882153518:AAHJUWfsAYgPwdaSIDI1FhhxCw1xRcSh020"
@@ -17,6 +19,19 @@ DB_PATH = "bot_data.db"
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# ----------------- RENDER UCHUN DUMMY SERVER -----------------
+async def dummy_web_server():
+    async def handle(request):
+        return web.Response(text="Bot is running 24/7!")
+
+    app = web.Application()
+    app.router.add_get("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
 # ----------------- FSM HOLATLARI -----------------
 class UserState(StatesGroup):
@@ -138,7 +153,7 @@ async def get_sub_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
-# ----------------- ASOSIY MENYU -----------------
+# ----------------- MENYULAR -----------------
 def get_main_menu(user_id: int):
     kb = [
         [KeyboardButton(text="✍️ Post yuborish")],
@@ -228,6 +243,37 @@ async def ask_post(message: types.Message, state: FSMContext):
         "📷 Rasm, 🎥 video yoki 📝 matn ko'rinishida jo'natishingiz mumkin.",
         parse_mode="HTML"
     )
+
+@dp.message(StateFilter(UserState.waiting_for_post))
+async def handle_user_post(message: types.Message, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO posts (user_id, message_id) VALUES (?, ?)",
+            (user.id, message.message_id)
+        )
+        post_id = cursor.lastrowid
+        await db.commit()
+
+    await message.answer("✅ <b>Postingiz tekshiruvga yuborildi!</b>\nTez orada baholanadi.", reply_markup=get_main_menu(user.id), parse_mode="HTML")
+
+    log_chat = await get_setting("log_chat")
+    admins = await get_all_admins()
+
+    forward_targets = [int(log_chat)] if log_chat else admins
+    for chat_id in forward_targets:
+        try:
+            sent_msg = await message.forward(chat_id=chat_id)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📥 <b>Yangi post #{post_id}</b>\nKimdan: {user.full_name} (@{user.username})\nID: <code>{user.id}</code>",
+                reply_markup=get_admin_post_keyboard(post_id, in_channel=0),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logging.error(f"Post forward qilishda xatolik ({chat_id}): {e}")
 
 @dp.message(F.text == "📊 Profilim")
 async def show_profile(message: types.Message, state: FSMContext):
@@ -326,6 +372,10 @@ async def process_buy(callback: types.CallbackQuery):
         await callback.answer(f"⚠️ Yulduzchalar yetarli emas! Sizda: {score} ⭐, kerak: {price} ⭐", show_alert=True)
         return
 
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET total_score = total_score - ? WHERE user_id = ?", (price, callback.from_user.id))
+        await db.commit()
+
     await callback.answer("Buyurtmangiz qabul qilindi!", show_alert=True)
     await callback.message.answer(
         f"🎉 <b>Xaridingiz uchun tashakkur!</b>\n\n"
@@ -365,7 +415,6 @@ async def open_admin_panel(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-# 1. Do'kon boshqaruvi
 @dp.callback_query(F.data == "admin_manage_shop")
 async def manage_shop_menu(callback: types.CallbackQuery):
     if callback.from_user.id != SUPER_ADMIN_ID:
@@ -460,448 +509,4 @@ async def list_shop_delete(callback: types.CallbackQuery):
     builder = InlineKeyboardBuilder()
     for i_id, title, price in items:
         builder.button(text=f"❌ {title} ({price} ⭐)", callback_data=f"del_shop_item:{i_id}")
-    builder.button(text="⬅️ Ortga", callback_data="admin_manage_shop")
-    builder.adjust(1)
-
-    await callback.message.edit_text("O'chirmoqchi bo'lgan mahsulotingizni tanlang:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("del_shop_item:"))
-async def process_del_shop_item(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    item_id = int(callback.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
-        await db.commit()
-    await callback.answer("Mahsulot o'chirildi!")
-    await list_shop_delete(callback)
-
-@dp.callback_query(F.data == "admin_back_to_panel")
-async def back_to_admin_panel(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    cur_ch = await get_setting("channel")
-    cur_log = await get_setting("log_chat")
-    shop_st = "Faol ✅" if (await get_setting("shop_status")) == "active" else "Sozlanmoqda 🚧"
-
-    await callback.message.edit_text(
-        f"🛠 <b>Boshqaruv Paneli</b>\n\n"
-        f"📢 Kanal: <b>{cur_ch if cur_ch else 'Oʻchiq'}</b>\n"
-        f"📑 Arxiv: <b>{cur_log if cur_log else 'Ulanmagan'}</b>\n"
-        f"🛍 Do‘kon: <b>{shop_st}</b>\n\n"
-        "Kerakli bo'limni tanlang:",
-        reply_markup=get_admin_panel_inline(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-# 2. Kanal sozlash
-@dp.callback_query(F.data == "admin_set_channel")
-async def start_set_channel(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    await state.set_state(AdminState.waiting_for_new_channel)
-    await callback.message.answer(
-        "📢 Majburiy obuna kanali username'ini yuboring (masalan: <b>@kanalim</b>):\n"
-        "<i>(O'chirish uchun '0' deb yozing)</i>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(StateFilter(AdminState.waiting_for_new_channel), F.text)
-async def save_new_channel(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    val = message.text.strip()
-    if val == "0":
-        await set_setting("channel", "")
-        await message.answer("✅ Majburiy obuna o'chirildi.", reply_markup=get_main_menu(message.from_user.id))
-    else:
-        if not (val.startswith("@") or val.startswith("-100")):
-            val = "@" + val
-        await set_setting("channel", val)
-        await message.answer(f"✅ Kanal saqlandi: <b>{val}</b>", parse_mode="HTML", reply_markup=get_main_menu(message.from_user.id))
-    await state.clear()
-
-# 3. Arxiv chat sozlash
-@dp.callback_query(F.data == "admin_set_log_chat")
-async def start_set_log_chat(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    await state.set_state(AdminState.waiting_for_log_chat)
-    await callback.message.answer(
-        "📑 <b>Arxiv (post va ballar) guruhi/kanali:</b>\n\n"
-        "Username yoki ID raqamini (masalan: <code>-100...</code>) yuboring:\n"
-        "<i>(O'chirish uchun '0' deb yozing)</i>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(StateFilter(AdminState.waiting_for_log_chat), F.text)
-async def save_new_log_chat(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    val = message.text.strip()
-    if val == "0":
-        await set_setting("log_chat", "")
-        await message.answer("✅ Arxiv guruhi o'chirildi.", reply_markup=get_main_menu(message.from_user.id))
-    else:
-        await set_setting("log_chat", val)
-        await message.answer(f"✅ Arxiv guruhi saqlandi: <b>{val}</b>", parse_mode="HTML", reply_markup=get_main_menu(message.from_user.id))
-    await state.clear()
-
-# 4. Tekshiruvchi qo'shish
-@dp.callback_query(F.data == "admin_add_checker")
-async def start_add_admin(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    await state.set_state(AdminState.waiting_for_new_admin)
-    await callback.message.answer(
-        "➕ <b>Yangi tekshiruvchi qo'shish:</b>\nUning <b>@username</b> yoki <b>ID</b> sini kiriting:\n(Bekor qilish uchun '0'):",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(StateFilter(AdminState.waiting_for_new_admin), F.text)
-async def save_new_admin(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    query = message.text.strip()
-    if query == "0":
-        await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=get_main_menu(message.from_user.id))
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        if query.isdigit():
-            user_id = int(query)
-        else:
-            uname = query.replace("@", "")
-            cursor = await db.execute("SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
-            row = await cursor.fetchone()
-            user_id = row[0] if row else None
-
-        if not user_id:
-            await message.answer("❌ Foydalanuvchi topilmadi. U avval botga kirib /start bosgan bo'lishi kerak!")
-            return
-
-        await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
-        await db.commit()
-
-    await state.clear()
-    await message.answer(f"✅ Tekshiruvchi admin qo'shildi (ID: <code>{user_id}</code>)!", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
-
-# 5. Tekshiruvchini o'chirish
-@dp.callback_query(F.data == "admin_remove_checker")
-async def start_remove_admin(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT user_id FROM admins WHERE user_id != ?", (SUPER_ADMIN_ID,))
-        rows = await cursor.fetchall()
-
-    if not rows:
-        await callback.answer("Qo'shimcha tekshiruvchilar yo'q!", show_alert=True)
-        return
-
-    builder = InlineKeyboardBuilder()
-    for (aid,) in rows:
-        builder.button(text=f"❌ O'chirish: {aid}", callback_data=f"del_admin:{aid}")
-    builder.adjust(1)
-    await callback.message.answer("O'chirmoqchi bo'lgan tekshiruvchini tanlang:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("del_admin:"))
-async def process_del_admin(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    del_id = int(callback.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM admins WHERE user_id = ?", (del_id,))
-        await db.commit()
-    await callback.message.edit_text(f"✅ Tekshiruvchi (ID: {del_id}) o'chirildi!")
-    await callback.answer()
-
-# 6. Reklama yuborish
-@dp.callback_query(F.data == "admin_broadcast")
-async def start_broadcast(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    await state.set_state(AdminState.waiting_for_broadcast)
-    await callback.message.answer(
-        "📨 <b>Reklama xabari:</b>\n\nBarcha foydalanuvchilarga yubormoqchi bo'lgan xabaringizni yuboring:\n<i>(Bekor qilish uchun '0' deb yozing)</i>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(StateFilter(AdminState.waiting_for_broadcast))
-async def process_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    if message.text and message.text.strip() == "0":
-        await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=get_main_menu(message.from_user.id))
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        users = await (await db.execute("SELECT user_id FROM users")).fetchall()
-
-    await message.answer("🚀 Xabar yuborilmoqda...")
-    sent, failed = 0, 0
-    for (uid,) in users:
-        try:
-            await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-
-    await state.clear()
-    await message.answer(f"📊 <b>Natija:</b>\n\n✅ Yetkazildi: {sent} ta\n❌ Bloklagan: {failed} ta", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
-
-# 7. Ballni tahrirlash
-@dp.callback_query(F.data == "admin_edit_score")
-async def ask_target_user(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    await state.set_state(AdminState.waiting_for_user_query)
-    await callback.message.answer(
-        "👤 Ballini o'zgartirmoqchi bo'lgan foydalanuvchining <b>@username</b> yoki <b>ID</b> sini kiriting:\n(Bekor qilish uchun '0'):",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(StateFilter(AdminState.waiting_for_user_query), F.text)
-async def process_target_user(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    query = message.text.strip()
-    if query == "0":
-        await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=get_main_menu(message.from_user.id))
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        if query.isdigit():
-            cursor = await db.execute("SELECT user_id, full_name, total_score FROM users WHERE user_id = ?", (int(query),))
-        else:
-            uname = query.replace("@", "")
-            cursor = await db.execute("SELECT user_id, full_name, total_score FROM users WHERE LOWER(username) = LOWER(?)", (uname,))
-        user = await cursor.fetchone()
-
-    if not user:
-        await message.answer("❌ Foydalanuvchi topilmadi. Qaytadan tekshiring:")
-        return
-
-    uid, name, cur_score = user
-    await state.update_data(target_id=uid, target_name=name)
-    await state.set_state(AdminState.waiting_for_new_score)
-
-    await message.answer(
-        f"👤 {name} (ID: <code>{uid}</code>)\n⭐ Hozirgi ball: <b>{cur_score}</b>\n\nYangi ballni kiriting:",
-        parse_mode="HTML"
-    )
-
-@dp.message(StateFilter(AdminState.waiting_for_new_score), F.text)
-async def set_new_score(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    text = message.text.strip()
-    if not (text.isdigit() or (text.startswith("-") and text[1:].isdigit())):
-        await message.answer("Iltimos, son kiriting:")
-        return
-
-    new_score = int(text)
-    data = await state.get_data()
-    target_id, target_name = data["target_id"], data["target_name"]
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET total_score = ? WHERE user_id = ?", (new_score, target_id))
-        await db.commit()
-
-    await state.clear()
-    await message.answer(f"✅ Ball yangilandi!\n{target_name} — <b>{new_score} ⭐</b>", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
-
-# 8. Statistika
-@dp.callback_query(F.data == "admin_sys_stats")
-async def show_system_stats(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        u_count = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
-        p_count = (await (await db.execute("SELECT COUNT(*) FROM posts WHERE status = 'approved'")).fetchone())[0]
-        a_count = (await (await db.execute("SELECT COUNT(*) FROM admins")).fetchone())[0]
-
-    cur_ch = await get_setting("channel")
-    cur_log = await get_setting("log_chat")
-    await callback.message.edit_text(
-        f"📈 <b>Bot umumiy statistikasi:</b>\n\n"
-        f"📢 Majburiy kanal: <b>{cur_ch if cur_ch else 'Oʻchiq'}</b>\n"
-        f"📑 Arxiv guruhi: <b>{cur_log if cur_log else 'Ulanmagan'}</b>\n"
-        f"👨‍⚖️ Tekshiruvchilar: <b>{a_count} nafar</b>\n"
-        f"👥 Foydalanuvchilar: <b>{u_count} kishi</b>\n"
-        f"✅ Tasdiqlangan postlar: <b>{p_count} ta</b>",
-        reply_markup=get_admin_panel_inline(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-# ----------------- FOYDALANUVCHIDAN POST QABUL QILISH -----------------
-@dp.message(StateFilter(UserState.waiting_for_post), F.text | F.photo | F.video)
-async def process_user_post(message: types.Message, state: FSMContext):
-    user = message.from_user
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("INSERT INTO posts (user_id, message_id) VALUES (?, ?)", (user.id, message.message_id))
-        post_id = cursor.lastrowid
-        await db.commit()
-
-    await state.clear()
-    await message.answer("✅ <b>Postingiz qabul qilindi va ko'rib chiqishga yuborildi!</b>", reply_markup=get_main_menu(user.id), parse_mode="HTML")
-
-    username_str = f"@{user.username}" if user.username else "Mavjud emas"
-    admin_card = (
-        f"📩 <b>Yangi post keldi! (ID: #{post_id})</b>\n\n"
-        f"👤 <b>Muallif:</b> {user.full_name}\n"
-        f"🔗 <b>Username:</b> {username_str}\n"
-        f"🆔 <b>ID:</b> <code>{user.id}</code>\n\n"
-        f"⭐ <b>Postni baholang:</b>"
-    )
-
-    for admin_id in await get_all_admins():
-        try:
-            await bot.copy_message(chat_id=admin_id, from_chat_id=message.chat.id, message_id=message.message_id)
-            await bot.send_message(chat_id=admin_id, text=admin_card, reply_markup=get_admin_post_keyboard(post_id, in_channel=0), parse_mode="HTML")
-        except Exception:
-            pass
-
-    log_chat = await get_setting("log_chat")
-    if log_chat:
-        try:
-            await bot.copy_message(chat_id=log_chat, from_chat_id=message.chat.id, message_id=message.message_id)
-            await bot.send_message(chat_id=log_chat, text=f"📥 <b>Yangi post qabul qilindi:</b>\nMuallif: {user.full_name} ({username_str})", parse_mode="HTML")
-        except Exception as e:
-            logging.warning(f"Arxivga yuborishda xatolik: {e}")
-
-# ----------------- KANALGA CHIQARILADI (STATUS) -----------------
-@dp.callback_query(F.data.startswith("toggle_channel:"))
-async def toggle_channel_status(callback: types.CallbackQuery):
-    if not await is_checker_admin(callback.from_user.id):
-        await callback.answer("Faqat tekshiruvchilar bosa oladi!", show_alert=True)
-        return
-
-    post_id = int(callback.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT in_channel FROM posts WHERE id = ?", (post_id,))
-        row = await cursor.fetchone()
-        if not row:
-            return
-        new_val = 0 if row[0] == 1 else 1
-        await db.execute("UPDATE posts SET in_channel = ? WHERE id = ?", (new_val, post_id))
-        await db.commit()
-
-    await callback.answer("✅ Kanalga chiqariladi deb belgilandi!" if new_val == 1 else "Bekor qilindi!", show_alert=True)
-    await callback.message.edit_reply_markup(reply_markup=get_admin_post_keyboard(post_id, in_channel=new_val))
-
-# ----------------- TEKSHIRUVCHILAR BAHOLASHI VA HISOBOT -----------------
-@dp.callback_query(F.data.startswith("rate:"))
-async def process_rating(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_checker_admin(callback.from_user.id):
-        await callback.answer("Faqat tekshiruvchilar baholay oladi!", show_alert=True)
-        return
-
-    _, post_id_str, score_str = callback.data.split(":")
-    post_id, score = int(post_id_str), int(score_str)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT status FROM posts WHERE id = ?", (post_id,))
-        post = await cursor.fetchone()
-        if not post or post[0] != "pending":
-            await callback.answer("Bu post allaqachon baholangan!", show_alert=True)
-            return
-
-    await state.set_state(AdminState.waiting_for_comment)
-    await state.update_data(post_id=post_id, score=score, admin_msg_id=callback.message.message_id, orig_text=callback.message.text)
-    await callback.answer()
-    await callback.message.answer(
-        f"📝 <b>Baho: {score} ⭐</b>\n\nMuallifga izoh yuboring (Izohsiz bo'lsa '0' deb yozing):",
-        parse_mode="HTML"
-    )
-
-@dp.message(StateFilter(AdminState.waiting_for_comment), F.text)
-async def process_admin_comment(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    post_id, score, admin_msg_id, admin_name = data["post_id"], data["score"], data["admin_msg_id"], message.from_user.full_name
-    comment_text = message.text
-    has_comment = comment_text.lower() not in ["0", "yo'q", "yoq", "none", "-"]
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT user_id, in_channel FROM posts WHERE id = ?", (post_id,))
-        post = await cursor.fetchone()
-        if not post:
-            await state.clear()
-            return
-        author_id, in_channel = post
-
-        u_cursor = await db.execute("SELECT full_name, username FROM users WHERE user_id = ?", (author_id,))
-        user_info = await u_cursor.fetchone()
-        u_name = user_info[0] if user_info else "Noma'lum"
-        u_uname = f"@{user_info[1]}" if (user_info and user_info[1]) else "Mavjud emas"
-
-        if score > 0:
-            await db.execute("UPDATE posts SET score = ?, status = 'approved', comment = ? WHERE id = ?", (score, comment_text if has_comment else None, post_id))
-            await db.execute("UPDATE users SET total_score = total_score + ?, posts_count = posts_count + 1 WHERE user_id = ?", (score, author_id))
-            user_msg = f"🎉 <b>Postingiz qabul qilindi!</b>\n\n⭐ <b>Baholandi:</b> {score} ball\n👨‍⚖️ <b>Hakam:</b> {admin_name}"
-            status_text = f"📌 <b>Baho:</b> {score} ⭐ (Hakam: {admin_name})"
-        else:
-            await db.execute("UPDATE posts SET status = 'rejected', comment = ? WHERE id = ?", (comment_text if has_comment else None, post_id))
-            user_msg = f"❌ <b>Postingiz qabul qilinmadi.</b>\n\n👨‍⚖️ <b>Hakam:</b> {admin_name}"
-            status_text = f"📌 <b>Baho:</b> Rad etildi ❌ (Hakam: {admin_name})"
-
-        if in_channel == 1:
-            status_text += "\n📢 <b>Kanal:</b> Kanalga chiqariladi ✅"
-            user_msg += "\n📢 <i>Postingiz kanalga chiqarish uchun tavsiya etildi!</i>"
-
-        await db.commit()
-
-    if has_comment:
-        user_msg += f"\n💬 <b>Izoh:</b> <i>{comment_text}</i>"
-        status_text += f"\n💬 <b>Izoh:</b> {comment_text}"
-
-    try:
-        await bot.send_message(chat_id=author_id, text=user_msg, parse_mode="HTML")
-    except Exception:
-        pass
-
-    try:
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=admin_msg_id, text=f"{data['orig_text']}\n\n{status_text}", parse_mode="HTML")
-    except Exception:
-        pass
-
-    log_chat = await get_setting("log_chat")
-    if log_chat:
-        try:
-            log_report = (
-                f"📊 <b>Post baholandi (Post #{post_id})</b>\n\n"
-                f"👤 <b>Muallif:</b> {u_name} ({u_uname})\n"
-                f"👨‍⚖️ <b>Hakam:</b> {admin_name}\n"
-                f"⭐ <b>Qo'yilgan ball:</b> {score} ⭐\n"
-                f"📢 <b>Kanalga tavsiya:</b> {'Ha ✅' if in_channel == 1 else 'Yo‘q'}\n"
-                f"💬 <b>Izoh:</b> {comment_text if has_comment else 'Izohsiz'}"
-            )
-            await bot.send_message(chat_id=log_chat, text=log_report, parse_mode="HTML")
-        except Exception:
-            pass
-
-    await message.answer("✅ Natija saqlandi va arxivga yetkazildi!")
-    await state.clear()
-
-# ----------------- ISHGA TUSHIRISH -----------------
-async def main():
-    await init_db()
-    print("Bot muvaffaqiyatli ishga tushdi...")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    builder.button(text="⬅️ Ortga", callback
