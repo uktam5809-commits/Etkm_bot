@@ -507,9 +507,9 @@ async def process_del_shop_item(callback: types.CallbackQuery):
     if callback.from_user.id != SUPER_ADMIN_ID:
         return
     item_id = int(callback.data.split(":")[1])
-        async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
-        await db.commit()
+    async with aiosqlite.connect(DB_PATH) as db:
+    await db.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
+    await db.commit()
     await callback.answer("Mahsulot o'chirildi!")
     await list_shop_delete(callback)
 
