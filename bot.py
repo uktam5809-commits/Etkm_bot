@@ -153,7 +153,7 @@ async def get_sub_keyboard():
     builder.adjust(1)
     return builder.as_markup()
 
-# ----------------- MENYULAR -----------------
+# ----------------- ASOSIY MENYU -----------------
 def get_main_menu(user_id: int):
     kb = [
         [KeyboardButton(text="✍️ Post yuborish")],
@@ -265,7 +265,7 @@ async def handle_user_post(message: types.Message, state: FSMContext):
     forward_targets = [int(log_chat)] if log_chat else admins
     for chat_id in forward_targets:
         try:
-            sent_msg = await message.forward(chat_id=chat_id)
+            await message.forward(chat_id=chat_id)
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"📥 <b>Yangi post #{post_id}</b>\nKimdan: {user.full_name} (@{user.username})\nID: <code>{user.id}</code>",
@@ -509,4 +509,4 @@ async def list_shop_delete(callback: types.CallbackQuery):
     builder = InlineKeyboardBuilder()
     for i_id, title, price in items:
         builder.button(text=f"❌ {title} ({price} ⭐)", callback_data=f"del_shop_item:{i_id}")
-    builder.button(text="⬅️ Ortga", callback
+    builder.button(text="⬅️ Ortga", callback_data="
