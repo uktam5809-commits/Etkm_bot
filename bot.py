@@ -20,19 +20,6 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ----------------- RENDER UCHUN DUMMY SERVER -----------------
-async def dummy_web_server():
-    async def handle(request):
-        return web.Response(text="Bot is running 24/7!")
-
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
 # ----------------- FSM HOLATLARI -----------------
 class UserState(StatesGroup):
     waiting_for_post = State()
@@ -510,4 +497,13 @@ async def list_shop_delete(callback: types.CallbackQuery):
     for i_id, title, price in items:
         builder.button(text=f"❌ {title} ({price} ⭐)", callback_data=f"del_shop_item:{i_id}")
     builder.button(text="⬅️ Ortga", callback_data="admin_manage_shop")
+    builder.adjust(1)
 
+    await callback.message.edit_text("O'chirmoqchi bo'lgan mahsulotingizni tanlang:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("del_shop_item:"))
+async def process_del_shop_item(callback: types.CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        return
+    item_id = int(callback.data.split(":")[1])
