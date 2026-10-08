@@ -509,4 +509,5 @@ async def list_shop_delete(callback: types.CallbackQuery):
     builder = InlineKeyboardBuilder()
     for i_id, title, price in items:
         builder.button(text=f"❌ {title} ({price} ⭐)", callback_data=f"del_shop_item:{i_id}")
-    builder.button(text="⬅️ Ortga", callback_data="
+    builder.button(text="⬅️ Ortga", callback_data="admin_manage_shop")
+
