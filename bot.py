@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -9,11 +10,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import aiosqlite
-from aiohttp import web
 
 # ----------------- ASOSIY SOZLAMALAR -----------------
-BOT_TOKEN = "8882153518:AAHJUWfsAYgPwdaSIDI1FhhxCw1xRcSh020"
-SUPER_ADMIN_ID = 6439380297  # Bosh admin
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8882153518:AAHJUWfsAYgPwdaSIDI1FhhxCw1xRcSh020")
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "6439380297"))
 DB_PATH = "bot_data.db"
 
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +23,7 @@ dp = Dispatcher(storage=MemoryStorage())
 # ----------------- FSM HOLATLARI -----------------
 class UserState(StatesGroup):
     waiting_for_post = State()
+    waiting_for_search_username = State()
 
 class AdminState(StatesGroup):
     waiting_for_user_query = State()
@@ -31,7 +32,7 @@ class AdminState(StatesGroup):
     waiting_for_log_chat = State()
     waiting_for_new_admin = State()
     waiting_for_broadcast = State()
-    waiting_for_comment = State()
+    waiting_for_post_comment = State()
     waiting_for_shop_item = State()
 
 # ----------------- MA'LUMOTLAR BAZASI -----------------
@@ -54,7 +55,8 @@ async def init_db():
                 full_name TEXT,
                 username TEXT,
                 total_score INTEGER DEFAULT 0,
-                posts_count INTEGER DEFAULT 0
+                posts_count INTEGER DEFAULT 0,
+                channel_posts_count INTEGER DEFAULT 0
             )
         """)
         await db.execute("""
@@ -64,8 +66,7 @@ async def init_db():
                 message_id INTEGER,
                 score INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending',
-                comment TEXT,
-                in_channel INTEGER DEFAULT 0
+                comment TEXT
             )
         """)
         await db.execute("""
@@ -79,8 +80,8 @@ async def init_db():
 
         for col, query in [
             ("username", "ALTER TABLE users ADD COLUMN username TEXT"),
-            ("comment", "ALTER TABLE posts ADD COLUMN comment TEXT"),
-            ("in_channel", "ALTER TABLE posts ADD COLUMN in_channel INTEGER DEFAULT 0")
+            ("channel_posts_count", "ALTER TABLE users ADD COLUMN channel_posts_count INTEGER DEFAULT 0"),
+            ("comment", "ALTER TABLE posts ADD COLUMN comment TEXT")
         ]:
             try:
                 await db.execute(query)
@@ -124,9 +125,7 @@ async def check_subscription(user_id: int) -> bool:
         return True
     try:
         member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-        if member.status in ["left", "kicked"]:
-            return False
-        return True
+        return member.status not in ["left", "kicked"]
     except Exception as e:
         logging.warning(f"Obunada xatolik: {e}")
         return True
@@ -145,7 +144,7 @@ def get_main_menu(user_id: int):
     kb = [
         [KeyboardButton(text="✍️ Post yuborish")],
         [KeyboardButton(text="📊 Profilim"), KeyboardButton(text="🏆 Top 10 Reyting")],
-        [KeyboardButton(text="🛍 Yulduzlar do‘koni")]
+        [KeyboardButton(text="🔍 Foydalanuvchi qidirish"), KeyboardButton(text="🛍 Yulduzlar do‘koni")]
     ]
     if user_id == SUPER_ADMIN_ID:
         kb.append([KeyboardButton(text="⚙️ Admin Panel")])
@@ -153,6 +152,7 @@ def get_main_menu(user_id: int):
 
 def get_admin_panel_inline():
     builder = InlineKeyboardBuilder()
+    builder.button(text="👥 Barcha ishtirokchilar", callback_data="admin_all_users")
     builder.button(text="📢 Majburiy kanalni sozlash", callback_data="admin_set_channel")
     builder.button(text="📑 Arxiv chatini sozlash", callback_data="admin_set_log_chat")
     builder.button(text="🛍 Do‘konni boshqarish", callback_data="admin_manage_shop")
@@ -164,12 +164,11 @@ def get_admin_panel_inline():
     builder.adjust(1)
     return builder.as_markup()
 
-def get_admin_post_keyboard(post_id: int, in_channel: int = 0):
+def get_admin_post_keyboard(post_id: int):
     builder = InlineKeyboardBuilder()
     for score in range(1, 6):
         builder.button(text=f"{score} ⭐", callback_data=f"rate:{post_id}:{score}")
-    status_ch = "✅ Kanalga chiqariladi" if in_channel == 1 else "📢 Kanalga chiqarish"
-    builder.button(text=status_ch, callback_data=f"toggle_channel:{post_id}")
+    builder.button(text="📢 Kanalga chiqarildi deb belgilash", callback_data=f"mark_channel:{post_id}")
     builder.button(text="❌ Rad etish", callback_data=f"rate:{post_id}:0")
     builder.adjust(5, 1, 1)
     return builder.as_markup()
@@ -256,7 +255,7 @@ async def handle_user_post(message: types.Message, state: FSMContext):
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"📥 <b>Yangi post #{post_id}</b>\nKimdan: {user.full_name} (@{user.username})\nID: <code>{user.id}</code>",
-                reply_markup=get_admin_post_keyboard(post_id, in_channel=0),
+                reply_markup=get_admin_post_keyboard(post_id),
                 parse_mode="HTML"
             )
         except Exception as e:
@@ -267,19 +266,21 @@ async def show_profile(message: types.Message, state: FSMContext):
     await state.clear()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT total_score, posts_count FROM users WHERE user_id = ?",
+            "SELECT total_score, posts_count, channel_posts_count FROM users WHERE user_id = ?",
             (message.from_user.id,)
         )
         data = await cursor.fetchone()
 
     total_score = data[0] if data else 0
     posts_count = data[1] if data else 0
+    ch_posts_count = data[2] if data and len(data) > 2 and data[2] else 0
 
     await message.answer(
         f"👤 <b>Sizning profilingiz:</b>\n\n"
         f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"📝 Qabul qilingan postlar: <b>{posts_count} ta</b>\n"
-        f"⭐ Jami yulduzlar: <b>{total_score} ball</b>",
+        f"⭐ Jami yulduzlar: <b>{total_score} ball</b>\n"
+        f"📝 Baholangan postlar: <b>{posts_count} ta</b>\n"
+        f"📢 Kanalga chiqqan postlar: <b>{ch_posts_count} ta</b>",
         parse_mode="HTML"
     )
 
@@ -288,8 +289,8 @@ async def show_leaderboard(message: types.Message, state: FSMContext):
     await state.clear()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT full_name, username, total_score, posts_count FROM users "
-            "WHERE total_score > 0 ORDER BY total_score DESC LIMIT 10"
+            "SELECT full_name, username, total_score, channel_posts_count FROM users "
+            "WHERE total_score > 0 OR channel_posts_count > 0 ORDER BY total_score DESC LIMIT 10"
         )
         top_users = await cursor.fetchall()
 
@@ -298,12 +299,60 @@ async def show_leaderboard(message: types.Message, state: FSMContext):
         return
 
     text = "🏆 <b>TOP-10 ishtirokchilar reytingi:</b>\n\n"
-    for idx, (name, uname, score, count) in enumerate(top_users, start=1):
+    for idx, (name, uname, score, ch_count) in enumerate(top_users, start=1):
         medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
         u_tag = f"(@{uname})" if uname else ""
-        text += f"{medal} <b>{name}</b> {u_tag} — {score} ⭐ ({count} ta post)\n"
+        ch_count = ch_count or 0
+        text += f"{medal} <b>{name}</b> {u_tag} — <b>{score} ⭐</b> | 📢 Kanalda: <b>{ch_count} ta</b>\n"
 
     await message.answer(text, parse_mode="HTML")
+
+# ----------------- FOYDALANUVCHILARNI QIDIRISH -----------------
+@dp.message(F.text == "🔍 Foydalanuvchi qidirish")
+async def ask_search_user(message: types.Message, state: FSMContext):
+    await state.set_state(UserState.waiting_for_search_username)
+    await message.answer(
+        "🔍 Qidirmoqchi bo'lgan foydalanuvchining <b>@username</b> ini yuboring:\n"
+        "<i>(Bekor qilish uchun '0' deb yozing)</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(StateFilter(UserState.waiting_for_search_username), F.text)
+async def process_search_user(message: types.Message, state: FSMContext):
+    query = message.text.strip().replace("@", "")
+    if query == "0":
+        await state.clear()
+        await message.answer("Qidiruv bekor qilindi.", reply_markup=get_main_menu(message.from_user.id))
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT full_name, username, total_score, posts_count, channel_posts_count "
+            "FROM users WHERE LOWER(username) = LOWER(?)",
+            (query,)
+        )
+        user_row = await cursor.fetchone()
+
+    await state.clear()
+    if not user_row:
+        await message.answer(
+            f"❌ <b>@{query}</b> foydalanuvchisi topilmadi.",
+            reply_markup=get_main_menu(message.from_user.id),
+            parse_mode="HTML"
+        )
+        return
+
+    name, uname, score, p_cnt, ch_cnt = user_row
+    ch_cnt = ch_cnt or 0
+    await message.answer(
+        f"🔍 <b>Foydalanuvchi ma'lumotlari:</b>\n\n"
+        f"👤 Ism: <b>{name}</b> (@{uname})\n"
+        f"⭐ To'plagan yulduzlari: <b>{score} ball</b>\n"
+        f"📝 Baholangan postlari: <b>{p_cnt} ta</b>\n"
+        f"📢 Kanalga chiqqan postlari: <b>{ch_cnt} ta</b>",
+        reply_markup=get_main_menu(message.from_user.id),
+        parse_mode="HTML"
+    )
 
 # ----------------- YULDUZLAR DO'KONI -----------------
 @dp.message(F.text == "🛍 Yulduzlar do‘koni")
@@ -348,18 +397,17 @@ async def process_buy(callback: types.CallbackQuery):
         u_cur = await db.execute("SELECT total_score FROM users WHERE user_id = ?", (callback.from_user.id,))
         u_row = await u_cur.fetchone()
 
-    if not item:
-        await callback.answer("Mahsulot topilmadi!", show_alert=True)
-        return
+        if not item:
+            await callback.answer("Mahsulot topilmadi!", show_alert=True)
+            return
 
-    title, price = item
-    score = u_row[0] if u_row else 0
+        title, price = item
+        score = u_row[0] if u_row else 0
 
-    if score < price:
-        await callback.answer(f"⚠️ Yulduzchalar yetarli emas! Sizda: {score} ⭐, kerak: {price} ⭐", show_alert=True)
-        return
+        if score < price:
+            await callback.answer(f"⚠️ Yulduzchalar yetarli emas! Sizda: {score} ⭐, kerak: {price} ⭐", show_alert=True)
+            return
 
-    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET total_score = total_score - ? WHERE user_id = ?", (price, callback.from_user.id))
         await db.commit()
 
@@ -381,7 +429,8 @@ async def process_buy(callback: types.CallbackQuery):
         )
     except Exception:
         pass
-        # ----------------- ADMIN PANEL -----------------
+
+# ----------------- ADMIN PANEL -----------------
 @dp.message(F.text == "⚙️ Admin Panel")
 async def open_admin_panel(message: types.Message, state: FSMContext):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -400,6 +449,33 @@ async def open_admin_panel(message: types.Message, state: FSMContext):
         reply_markup=get_admin_panel_inline(),
         parse_mode="HTML"
     )
+
+@dp.callback_query(F.data == "admin_all_users")
+async def list_all_participants(callback: types.CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT full_name, username, total_score, channel_posts_count FROM users ORDER BY total_score DESC")
+        users = await cursor.fetchall()
+
+    if not users:
+        await callback.answer("Foydalanuvchilar mavjud emas!", show_alert=True)
+        return
+
+    text = "👥 <b>Barcha ishtirokchilar ro'yxati:</b>\n\n"
+    for idx, (name, uname, score, ch_cnt) in enumerate(users, start=1):
+        u_tag = f"(@{uname})" if uname else "(username yo'q)"
+        ch_cnt = ch_cnt or 0
+        line = f"{idx}. <b>{name}</b> {u_tag} — ⭐ <b>{score} ball</b> | 📢 <b>{ch_cnt} ta</b> kanal posti\n"
+        if len(text + line) > 4000:
+            await callback.message.answer(text, parse_mode="HTML")
+            text = ""
+        text += line
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Ortga", callback_data="admin_back_to_panel")
+    await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_manage_shop")
 async def manage_shop_menu(callback: types.CallbackQuery):
@@ -531,7 +607,7 @@ async def back_to_admin_panel(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# 2. Kanal va Arxiv chatini sozlash
+# ----------------- KANAL VA ARXIV SOZLASH -----------------
 @dp.callback_query(F.data == "admin_set_channel")
 async def ask_channel(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != SUPER_ADMIN_ID:
@@ -566,7 +642,7 @@ async def save_log_chat(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Arxiv guruhi yangilandi!", reply_markup=get_main_menu(message.from_user.id))
 
-# 3. Tekshiruvchilarni boshqarish
+# ----------------- TEKSHIRUVCHILARNI BOSHQARISH -----------------
 @dp.callback_query(F.data == "admin_add_checker")
 async def start_add_checker(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != SUPER_ADMIN_ID:
@@ -624,7 +700,7 @@ async def process_del_admin(callback: types.CallbackQuery):
     await callback.answer("Tekshiruvchi o'chirildi!")
     await list_remove_checker(callback)
 
-# 4. Ball tahrirlash
+# ----------------- BALL TAHRIRLASH -----------------
 @dp.callback_query(F.data == "admin_edit_score")
 async def start_edit_score(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != SUPER_ADMIN_ID:
@@ -669,7 +745,7 @@ async def save_new_score(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Foydalanuvchi ({t_id}) bali {new_s} ga o'zgartirildi!", reply_markup=get_main_menu(message.from_user.id))
 
-# 5. Xabar tarqatish (Broadcast)
+# ----------------- XABAR TARQATISH -----------------
 @dp.callback_query(F.data == "admin_broadcast")
 async def ask_broadcast_msg(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != SUPER_ADMIN_ID:
@@ -702,20 +778,41 @@ async def send_broadcast(message: types.Message, state: FSMContext):
 
     await message.answer(f"✅ Xabar {count} ta foydalanuvchiga yuborildi!", reply_markup=get_main_menu(message.from_user.id))
 
-# 6. Postlarni tekshirish va baholash
-@dp.callback_query(F.data.startswith("toggle_channel:"))
-async def toggle_channel_btn(callback: types.CallbackQuery):
+# ----------------- POSTLARNI BAHOLASH VA TEKSHIRISH -----------------
+@dp.callback_query(F.data.startswith("mark_channel:"))
+async def process_mark_channel(callback: types.CallbackQuery):
     if not await is_checker_admin(callback.from_user.id):
         await callback.answer("Siz tekshiruvchi emassiz!", show_alert=True)
         return
+
     post_id = int(callback.data.split(":")[1])
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT in_channel FROM posts WHERE id = ?", (post_id,))
-        row = await cur.fetchone()
-        new_val = 0 if row and row[0] == 1 else 1
-        await db.execute("UPDATE posts SET in_channel = ? WHERE id = ?", (new_val, post_id))
+        cur = await db.execute("SELECT user_id FROM posts WHERE id = ?", (post_id,))
+        post = await cur.fetchone()
+        if not post:
+            await callback.answer("Post topilmadi!", show_alert=True)
+            return
+
+        u_id = post[0]
+        await db.execute("UPDATE users SET channel_posts_count = channel_posts_count + 1 WHERE user_id = ?", (u_id,))
         await db.commit()
-    await callback.message.edit_reply_markup(reply_markup=get_admin_post_keyboard(post_id, in_channel=new_val))
+
+    try:
+        await bot.send_message(
+            chat_id=u_id,
+            text="📢 <b>Tabriklaymiz!</b> Siz yuborgan post kanalga chiqarildi deb belgilandi va profilingizga qo'shildi!",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Izoh qoldirish", callback_data=f"add_comment:{post_id}:{u_id}")
+    await callback.message.edit_text(
+        f"📢 <b>Post #{post_id} kanalga chiqarilgani tasdiqlandi!</b>\nIjrochi: {callback.from_user.full_name}\n<i>(Eslatma: Kanalga postni o'zingiz joylaysiz)</i>",
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("rate:"))
@@ -729,36 +826,90 @@ async def rate_post(callback: types.CallbackQuery):
     score = int(score_str)
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id, message_id, in_channel FROM posts WHERE id = ?", (post_id,))
+        cur = await db.execute("SELECT user_id FROM posts WHERE id = ?", (post_id,))
         post = await cur.fetchone()
         if not post:
             await callback.answer("Post topilmadi!", show_alert=True)
             return
 
-        u_id, m_id, in_ch = post
+        u_id = post[0]
         if score > 0:
-            await db.execute("UPDATE users SET total_score = total_score + ?, posts_count = posts_count + 1 WHERE user_id = ?", (score, u_id))
+            await db.execute(
+                "UPDATE users SET total_score = total_score + ?, posts_count = posts_count + 1 WHERE user_id = ?",
+                (score, u_id)
+            )
             await db.execute("UPDATE posts SET score = ?, status = 'accepted' WHERE id = ?", (score, post_id))
         else:
             await db.execute("UPDATE posts SET score = 0, status = 'rejected' WHERE id = ?", (post_id,))
         await db.commit()
 
     if score > 0:
-        await bot.send_message(chat_id=u_id, text=f"🎉 <b>Postingiz qabul qilindi!</b>\nSizga <b>{score} ⭐</b> berildi.", parse_mode="HTML")
-        if in_ch == 1:
-            main_channel = await get_setting("channel")
-            if main_channel:
-                try:
-                    await bot.copy_message(chat_id=main_channel, from_chat_id=u_id, message_id=m_id)
-                except Exception as e:
-                    logging.error(f"Kanalga yuborishda xatolik: {e}")
+        try:
+            await bot.send_message(chat_id=u_id, text=f"🎉 <b>Postingiz qabul qilindi!</b>\nSizga <b>{score} ⭐</b> berildi.", parse_mode="HTML")
+        except Exception:
+            pass
     else:
-        await bot.send_message(chat_id=u_id, text="⚠️ Afsuski, postingiz qabul qilinmadi.", parse_mode="HTML")
+        try:
+            await bot.send_message(chat_id=u_id, text="⚠️ Afsuski, postingiz qabul qilinmadi.", parse_mode="HTML")
+        except Exception:
+            pass
 
-    await callback.message.edit_text(f"✅ <b>Post #{post_id} baholandi:</b> {score} ⭐\nBaholovchi: {callback.from_user.full_name}", parse_mode="HTML")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Izoh qoldirish", callback_data=f"add_comment:{post_id}:{u_id}")
+    await callback.message.edit_text(
+        f"✅ <b>Post #{post_id} baholandi:</b> {score} ⭐\nBaholovchi: {callback.from_user.full_name}",
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML"
+    )
     await callback.answer()
 
-# 7. Tizim statistikasi
+# ----------------- IZOH QO'SHISH BOSQICHI -----------------
+@dp.callback_query(F.data.startswith("add_comment:"))
+async def ask_post_comment(callback: types.CallbackQuery, state: FSMContext):
+    if not await is_checker_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q!", show_alert=True)
+        return
+    _, post_id, u_id = callback.data.split(":")
+    await state.update_data(comment_post_id=int(post_id), comment_user_id=int(u_id))
+    await state.set_state(AdminState.waiting_for_post_comment)
+    await callback.message.answer(
+        f"💬 <b>Post #{post_id}</b> uchun foydalanuvchiga yuboriladigan izohni yozing:\n"
+        "<i>(Bekor qilish uchun '0' deb yozing)</i>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.message(StateFilter(AdminState.waiting_for_post_comment), F.text)
+async def save_and_send_comment(message: types.Message, state: FSMContext):
+    if not await is_checker_admin(message.from_user.id):
+        return
+    comment_text = message.text.strip()
+    if comment_text == "0":
+        await state.clear()
+        await message.answer("Izoh bekor qilindi.")
+        return
+
+    data = await state.get_data()
+    post_id = data.get("comment_post_id")
+    target_user_id = data.get("comment_user_id")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE posts SET comment = ? WHERE id = ?", (comment_text, post_id))
+        await db.commit()
+
+    try:
+        await bot.send_message(
+            chat_id=target_user_id,
+            text=f"💬 <b>Postingiz (# {post_id}) yuzasidan admin izohi:</b>\n\n<i>{comment_text}</i>",
+            parse_mode="HTML"
+        )
+        await message.answer("✅ Izoh foydalanuvchiga muvaffaqiyatli yetkazildi!")
+    except Exception as e:
+        await message.answer(f"⚠️ Foydalanuvchiga izoh yuborishda xatolik: {e}")
+
+    await state.clear()
+
+# ----------------- TIZIM STATISTIKASI -----------------
 @dp.callback_query(F.data == "admin_sys_stats")
 async def show_stats(callback: types.CallbackQuery):
     if callback.from_user.id != SUPER_ADMIN_ID:
@@ -776,7 +927,7 @@ async def show_stats(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-# ----------------- ISHGA TUSHIRISH (RENDER PORTGA MOS) -----------------
+# ----------------- ISHGA TUSHIRISH (PORT VA WEB SERVIS) -----------------
 async def start_bot_background(app):
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
@@ -804,4 +955,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
