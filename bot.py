@@ -66,7 +66,8 @@ async def init_db():
                 message_id INTEGER,
                 score INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending',
-                comment TEXT
+                comment TEXT,
+                in_channel INTEGER DEFAULT 0
             )
         """)
         await db.execute("""
@@ -81,7 +82,8 @@ async def init_db():
         for col, query in [
             ("username", "ALTER TABLE users ADD COLUMN username TEXT"),
             ("channel_posts_count", "ALTER TABLE users ADD COLUMN channel_posts_count INTEGER DEFAULT 0"),
-            ("comment", "ALTER TABLE posts ADD COLUMN comment TEXT")
+            ("comment", "ALTER TABLE posts ADD COLUMN comment TEXT"),
+            ("in_channel", "ALTER TABLE posts ADD COLUMN in_channel INTEGER DEFAULT 0")
         ]:
             try:
                 await db.execute(query)
@@ -164,11 +166,12 @@ def get_admin_panel_inline():
     builder.adjust(1)
     return builder.as_markup()
 
-def get_admin_post_keyboard(post_id: int):
+def get_admin_post_keyboard(post_id: int, in_channel: int = 0):
     builder = InlineKeyboardBuilder()
     for score in range(1, 6):
         builder.button(text=f"{score} ⭐", callback_data=f"rate:{post_id}:{score}")
-    builder.button(text="📢 Kanalga chiqarildi deb belgilash", callback_data=f"mark_channel:{post_id}")
+    status_ch = "✅ Kanalga chiqariladi" if in_channel == 1 else "📢 Kanalga chiqarish"
+    builder.button(text=status_ch, callback_data=f"toggle_channel:{post_id}")
     builder.button(text="❌ Rad etish", callback_data=f"rate:{post_id}:0")
     builder.adjust(5, 1, 1)
     return builder.as_markup()
@@ -255,7 +258,7 @@ async def handle_user_post(message: types.Message, state: FSMContext):
             await bot.send_message(
                 chat_id=chat_id,
                 text=f"📥 <b>Yangi post #{post_id}</b>\nKimdan: {user.full_name} (@{user.username})\nID: <code>{user.id}</code>",
-                reply_markup=get_admin_post_keyboard(post_id),
+                reply_markup=get_admin_post_keyboard(post_id, in_channel=0),
                 parse_mode="HTML"
             )
         except Exception as e:
@@ -417,111 +420,14 @@ async def manage_shop_menu(callback: types.CallbackQuery):
     if callback.from_user.id != SUPER_ADMIN_ID:
         return
 
-    st = await get_setting("shop_status")
-    status_text = "Faol holatda ✅" if st == "active" else "Sozlanmoqda (o'chiq) 🚧"
-
     builder = InlineKeyboardBuilder()
-    if st == "active":
-        builder.button(text="🔒 Do'konni yopish (Sozlanmoqda)", callback_data="shop_toggle:inactive")
-    else:
-        builder.button(text="🔓 Do'konni ochish (Faollashtirish)", callback_data="shop_toggle:active")
-
-    builder.button(text="➕ Yangi mahsulot qo'shish", callback_data="shop_add_item")
-    builder.button(text="🗑 Mahsulotlarni o'chirish", callback_data="shop_delete_list")
     builder.button(text="⬅️ Ortga", callback_data="admin_back_to_panel")
-    builder.adjust(1)
-
     await callback.message.edit_text(
-        f"🛍 <b>Yulduzlar do‘koni boshqaruvi:</b>\n\n"
-        f"Hozirgi holat: <b>{status_text}</b>",
+        "🛍 <b>Yulduzlar do‘koni:</b>\nHozirda ushbu bo‘limda texnik ishlar olib borilmoqda.",
         reply_markup=builder.as_markup(),
         parse_mode="HTML"
     )
     await callback.answer()
-
-@dp.callback_query(F.data.startswith("shop_toggle:"))
-async def toggle_shop_status(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    new_st = callback.data.split(":")[1]
-    await set_setting("shop_status", new_st)
-    await callback.answer("Do‘kon holati yangilandi!")
-    await manage_shop_menu(callback)
-
-@dp.callback_query(F.data == "shop_add_item")
-async def start_add_item(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    await state.set_state(AdminState.waiting_for_shop_item)
-    await callback.message.answer(
-        "📦 <b>Yangi mahsulot qo'shish:</b>\n\n"
-        "Nomini va narxini quyidagi formatda yuboring:\n"
-        "<code>Nomi:Narxi</code>\n\n"
-        "Masalan: <b>Futbolka:50</b> yoki <b>Bloknot:20</b>\n"
-        "<i>(Bekor qilish uchun '0' deb yozing)</i>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
-@dp.message(StateFilter(AdminState.waiting_for_shop_item), F.text)
-async def save_shop_item(message: types.Message, state: FSMContext):
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    text = message.text.strip()
-    if text == "0":
-        await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=get_main_menu(message.from_user.id))
-        return
-
-    if ":" not in text:
-        await message.answer("Iltimos, <code>Nomi:Narxi</code> shaklida yuboring (Masalan: Kitob:30):", parse_mode="HTML")
-        return
-
-    title, price_str = text.split(":", 1)
-    if not price_str.strip().isdigit():
-        await message.answer("Narxi faqat musbat son bo'lishi kerak!")
-        return
-
-    title = title.strip()
-    price = int(price_str.strip())
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO shop_items (title, price) VALUES (?, ?)", (title, price))
-        await db.commit()
-
-    await state.clear()
-    await message.answer(f"✅ <b>{title}</b> mahsuloti ({price} ⭐) do‘konga qo‘shildi!", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
-
-@dp.callback_query(F.data == "shop_delete_list")
-async def list_shop_delete(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        items = await (await db.execute("SELECT id, title, price FROM shop_items")).fetchall()
-
-    if not items:
-        await callback.answer("Mahsulotlar yo'q!", show_alert=True)
-        return
-
-    builder = InlineKeyboardBuilder()
-    for i_id, title, price in items:
-        builder.button(text=f"❌ {title} ({price} ⭐)", callback_data=f"del_shop_item:{i_id}")
-    builder.button(text="⬅️ Ortga", callback_data="admin_manage_shop")
-    builder.adjust(1)
-
-    await callback.message.edit_text("O'chirmoqchi bo'lgan mahsulotingizni tanlang:", reply_markup=builder.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("del_shop_item:"))
-async def process_del_shop_item(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID:
-        return
-    item_id = int(callback.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
-        await db.commit()
-    await callback.answer("Mahsulot o'chirildi!")
-    await list_shop_delete(callback)
 
 @dp.callback_query(F.data == "admin_back_to_panel")
 async def back_to_admin_panel(callback: types.CallbackQuery):
@@ -714,44 +620,26 @@ async def send_broadcast(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Xabar {count} ta foydalanuvchiga yuborildi!", reply_markup=get_main_menu(message.from_user.id))
 
 # ----------------- POSTLARNI BAHOLASH VA TEKSHIRISH -----------------
-@dp.callback_query(F.data.startswith("mark_channel:"))
-async def process_mark_channel(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("toggle_channel:"))
+async def toggle_channel_btn(callback: types.CallbackQuery):
     if not await is_checker_admin(callback.from_user.id):
         await callback.answer("Siz tekshiruvchi emassiz!", show_alert=True)
         return
-
     post_id = int(callback.data.split(":")[1])
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM posts WHERE id = ?", (post_id,))
-        post = await cur.fetchone()
-        if not post:
-            await callback.answer("Post topilmadi!", show_alert=True)
-            return
-
-        u_id = post[0]
-        await db.execute("UPDATE users SET channel_posts_count = channel_posts_count + 1 WHERE user_id = ?", (u_id,))
+        cur = await db.execute("SELECT in_channel FROM posts WHERE id = ?", (post_id,))
+        row = await cur.fetchone()
+        new_val = 0 if row and row[0] == 1 else 1
+        await db.execute("UPDATE posts SET in_channel = ? WHERE id = ?", (new_val, post_id))
         await db.commit()
-
-    try:
-        await bot.send_message(
-            chat_id=u_id,
-            text="📢 <b>Tabriklaymiz!</b> Siz yuborgan post kanalga chiqarildi deb belgilandi va profilingizga qo'shildi!",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💬 Izoh qoldirish", callback_data=f"add_comment:{post_id}:{u_id}")
-    await callback.message.edit_text(
-        f"📢 <b>Post #{post_id} kanalga chiqarilgani tasdiqlandi!</b>\nIjrochi: {callback.from_user.full_name}\n<i>(Eslatma: Kanalga postni o'zingiz joylaysiz)</i>",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
+    
+    # Ball qo'yish tugmalari yo'qolib ketmaydi, kanalga chiqarish holati almashadi
+    await callback.message.edit_reply_markup(reply_markup=get_admin_post_keyboard(post_id, in_channel=new_val))
+    holat_matni = "Kanalga chiqarilishi belgilandi ✅" if new_val == 1 else "Kanalga chiqarish bekor qilindi ❌"
+    await callback.answer(holat_matni)
 
 @dp.callback_query(F.data.startswith("rate:"))
-async def rate_post(callback: types.CallbackQuery):
+async def start_rate_post(callback: types.CallbackQuery, state: FSMContext):
     if not await is_checker_admin(callback.from_user.id):
         await callback.answer("Siz tekshiruvchi emassiz!", show_alert=True)
         return
@@ -761,87 +649,93 @@ async def rate_post(callback: types.CallbackQuery):
     score = int(score_str)
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM posts WHERE id = ?", (post_id,))
+        cur = await db.execute("SELECT user_id, in_channel FROM posts WHERE id = ?", (post_id,))
         post = await cur.fetchone()
         if not post:
             await callback.answer("Post topilmadi!", show_alert=True)
             return
+        u_id, in_ch = post
 
-        u_id = post[0]
-        if score > 0:
-            await db.execute(
-                "UPDATE users SET total_score = total_score + ?, posts_count = posts_count + 1 WHERE user_id = ?",
-                (score, u_id)
-            )
-            await db.execute("UPDATE posts SET score = ?, status = 'accepted' WHERE id = ?", (score, post_id))
-        else:
-            await db.execute("UPDATE posts SET score = 0, status = 'rejected' WHERE id = ?", (post_id,))
-        await db.commit()
-
-    if score > 0:
-        try:
-            await bot.send_message(chat_id=u_id, text=f"🎉 <b>Postingiz qabul qilindi!</b>\nSizga <b>{score} ⭐</b> berildi.", parse_mode="HTML")
-        except Exception:
-            pass
-    else:
-        try:
-            await bot.send_message(chat_id=u_id, text="⚠️ Afsuski, postingiz qabul qilinmadi.", parse_mode="HTML")
-        except Exception:
-            pass
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💬 Izoh qoldirish", callback_data=f"add_comment:{post_id}:{u_id}")
-    await callback.message.edit_text(
-        f"✅ <b>Post #{post_id} baholandi:</b> {score} ⭐\nBaholovchi: {callback.from_user.full_name}",
-        reply_markup=builder.as_markup(),
-        parse_mode="HTML"
+    # Ball va holatni FSM xotirasiga saqlab, admin/tekshiruvchidan izoh so'raymiz
+    await state.update_data(
+        eval_post_id=post_id,
+        eval_user_id=u_id,
+        eval_score=score,
+        eval_in_channel=in_ch,
+        eval_admin_name=callback.from_user.full_name
     )
-    await callback.answer()
-
-# ----------------- IZOH QO'SHISH BOSQICHI -----------------
-@dp.callback_query(F.data.startswith("add_comment:"))
-async def ask_post_comment(callback: types.CallbackQuery, state: FSMContext):
-    if not await is_checker_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q!", show_alert=True)
-        return
-    _, post_id, u_id = callback.data.split(":")
-    await state.update_data(comment_post_id=int(post_id), comment_user_id=int(u_id))
     await state.set_state(AdminState.waiting_for_post_comment)
-    await callback.message.answer(
-        f"💬 <b>Post #{post_id}</b> uchun foydalanuvchiga yuboriladigan izohni yozing:\n"
-        "<i>(Bekor qilish uchun '0' deb yozing)</i>",
+
+    baholash_nomi = f"{score} ⭐" if score > 0 else "Rad etish ❌"
+    kanal_matni = " (Kanalga chiqariladi)" if in_ch == 1 else ""
+
+    await callback.message.edit_text(
+        f"📝 <b>Post #{post_id} uchun qaror qabul qilindi:</b> {baholash_nomi}{kanal_matni}\n\n"
+        "💬 <b>Foydalanuvchiga izoh yozasizmi?</b>\n"
+        "Izohingizni yozib yuboring (yoki izohsiz jo'natish uchun <b>0</b> deb yozing):",
         parse_mode="HTML"
     )
     await callback.answer()
 
 @dp.message(StateFilter(AdminState.waiting_for_post_comment), F.text)
-async def save_and_send_comment(message: types.Message, state: FSMContext):
+async def finish_evaluation_with_comment(message: types.Message, state: FSMContext):
     if not await is_checker_admin(message.from_user.id):
-        return
-    comment_text = message.text.strip()
-    if comment_text == "0":
-        await state.clear()
-        await message.answer("Izoh bekor qilindi.")
         return
 
     data = await state.get_data()
-    post_id = data.get("comment_post_id")
-    target_user_id = data.get("comment_user_id")
+    post_id = data.get("eval_post_id")
+    u_id = data.get("eval_user_id")
+    score = data.get("eval_score")
+    in_ch = data.get("eval_in_channel")
+    admin_name = data.get("eval_admin_name")
 
+    comment_text = message.text.strip()
+    has_comment = comment_text != "0"
+
+    # Ma'lumotlar bazasini yangilash
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE posts SET comment = ? WHERE id = ?", (comment_text, post_id))
+        if score > 0:
+            ch_add = 1 if in_ch == 1 else 0
+            await db.execute(
+                "UPDATE users SET total_score = total_score + ?, posts_count = posts_count + 1, "
+                "channel_posts_count = channel_posts_count + ? WHERE user_id = ?",
+                (score, ch_add, u_id)
+            )
+            await db.execute(
+                "UPDATE posts SET score = ?, status = 'accepted', comment = ? WHERE id = ?",
+                (score, comment_text if has_comment else None, post_id)
+            )
+        else:
+            await db.execute(
+                "UPDATE posts SET score = 0, status = 'rejected', comment = ? WHERE id = ?",
+                (comment_text if has_comment else None, post_id)
+            )
         await db.commit()
 
-    try:
-        await bot.send_message(
-            chat_id=target_user_id,
-            text=f"💬 <b>Postingiz (# {post_id}) yuzasidan admin izohi:</b>\n\n<i>{comment_text}</i>",
-            parse_mode="HTML"
-        )
-        await message.answer("✅ Izoh foydalanuvchiga muvaffaqiyatli yetkazildi!")
-    except Exception as e:
-        await message.answer(f"⚠️ Foydalanuvchiga izoh yuborishda xatolik: {e}")
+    # Foydalanuvchiga barcha natijani bitta qilib yetkazish
+    user_msg = ""
+    if score > 0:
+        user_msg += f"🎉 <b>Postingiz tekshiruvdan o'tdi va qabul qilindi!</b>\n"
+        user_msg += f"⭐ Sizga berilgan baho: <b>{score} ⭐</b>\n"
+        if in_ch == 1:
+            user_msg += f"📢 <b>Postingiz rasmiy kanalga chiqarilishi ma'qullandi!</b>\n"
+    else:
+        user_msg += f"⚠️ <b>Afsuski, postingiz qabul qilinmadi.</b>\n"
 
+    if has_comment:
+        user_msg += f"\n💬 <b>Tekshiruvchi izohi:</b>\n<i>{comment_text}</i>"
+
+    try:
+        await bot.send_message(chat_id=u_id, text=user_msg, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Foydalanuvchiga yuborishda xatolik: {e}")
+
+    # Tekshiruvchiga tasdiqlash
+    await message.answer(
+        f"✅ <b>Post #{post_id} muvaffaqiyatli baholandi va foydalanuvchiga barcha ma'lumot yetkazildi!</b>\n"
+        f"Baho: {score} ⭐ | Kanal: {'Ha' if in_ch == 1 else 'Yo‘q'} | Izoh: {'Mavjud' if has_comment else 'Yo‘q'}",
+        parse_mode="HTML"
+    )
     await state.clear()
 
 # ----------------- TIZIM STATISTIKASI -----------------
