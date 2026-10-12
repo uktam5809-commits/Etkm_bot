@@ -354,81 +354,16 @@ async def process_search_user(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-# ----------------- YULDUZLAR DO'KONI -----------------
+# ----------------- YULDUZLAR DO'KONI (TEXNIK ISHLAR) -----------------
 @dp.message(F.text == "🛍 Yulduzlar do‘koni")
 async def show_shop(message: types.Message, state: FSMContext):
     await state.clear()
-    status = await get_setting("shop_status")
-
-    if status != "active":
-        await message.answer(
-            "🚧 <b>Yulduzlar do‘koni sozlanmoqda...</b>\n\n"
-            "Tez orada to‘plagan yulduzchalaringiz evaziga qiziqarli sovg‘alarni qo‘lga kiritishingiz mumkin bo‘ladi! ✨",
-            parse_mode="HTML"
-        )
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id, title, price FROM shop_items")
-        items = await cursor.fetchall()
-
-    if not items:
-        await message.answer("🚧 Hozircha do‘konda mahsulotlar tayyorlanmoqda...")
-        return
-
-    builder = InlineKeyboardBuilder()
-    for item_id, title, price in items:
-        builder.button(text=f"{title} — {price} ⭐", callback_data=f"buy_item:{item_id}")
-    builder.adjust(1)
-
     await message.answer(
-        "🛍 <b>Yulduzlar do‘koni:</b>\n\n"
-        "O‘zingiz to‘plagan yulduzchalar evaziga quyidagi mahsulotlarni tanlashingiz mumkin:",
-        reply_markup=builder.as_markup(),
+        "🛠 <b>Yulduzlar do‘koni:</b>\n\n"
+        "Hozirda ushbu bo‘limda <b>texnik profilaktika va sozlash ishlari</b> olib borilmoqda. ⏳\n\n"
+        "Tez orada yangi imkoniyatlar bilan ishga tushiriladi. Sabringiz uchun rahmat! ✨",
         parse_mode="HTML"
     )
-
-@dp.callback_query(F.data.startswith("buy_item:"))
-async def process_buy(callback: types.CallbackQuery):
-    item_id = int(callback.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT title, price FROM shop_items WHERE id = ?", (item_id,))
-        item = await cursor.fetchone()
-        u_cur = await db.execute("SELECT total_score FROM users WHERE user_id = ?", (callback.from_user.id,))
-        u_row = await u_cur.fetchone()
-
-        if not item:
-            await callback.answer("Mahsulot topilmadi!", show_alert=True)
-            return
-
-        title, price = item
-        score = u_row[0] if u_row else 0
-
-        if score < price:
-            await callback.answer(f"⚠️ Yulduzchalar yetarli emas! Sizda: {score} ⭐, kerak: {price} ⭐", show_alert=True)
-            return
-
-        await db.execute("UPDATE users SET total_score = total_score - ? WHERE user_id = ?", (price, callback.from_user.id))
-        await db.commit()
-
-    await callback.answer("Buyurtmangiz qabul qilindi!", show_alert=True)
-    await callback.message.answer(
-        f"🎉 <b>Xaridingiz uchun tashakkur!</b>\n\n"
-        f"Siz <b>{title}</b> uchun buyurtma berdingiz. Tez orada admin siz bilan bog'lanadi.",
-        parse_mode="HTML"
-    )
-
-    try:
-        await bot.send_message(
-            chat_id=SUPER_ADMIN_ID,
-            text=f"🛒 <b>Yangi do‘kon xaridi!</b>\n\n"
-                 f"👤 Foydalanuvchi: {callback.from_user.full_name} (@{callback.from_user.username})\n"
-                 f"🆔 ID: <code>{callback.from_user.id}</code>\n"
-                 f"📦 Mahsulot: <b>{title}</b> ({price} ⭐)",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
 
 # ----------------- ADMIN PANEL -----------------
 @dp.message(F.text == "⚙️ Admin Panel")
@@ -438,7 +373,7 @@ async def open_admin_panel(message: types.Message, state: FSMContext):
     await state.clear()
     cur_ch = await get_setting("channel")
     cur_log = await get_setting("log_chat")
-    shop_st = "Faol ✅" if (await get_setting("shop_status")) == "active" else "Sozlanmoqda 🚧"
+    shop_st = "Sozlanmoqda 🚧"
 
     await message.answer(
         f"🛠 <b>Boshqaruv Paneli</b>\n\n"
@@ -594,7 +529,7 @@ async def back_to_admin_panel(callback: types.CallbackQuery):
         return
     cur_ch = await get_setting("channel")
     cur_log = await get_setting("log_chat")
-    shop_st = "Faol ✅" if (await get_setting("shop_status")) == "active" else "Sozlanmoqda 🚧"
+    shop_st = "Sozlanmoqda 🚧"
 
     await callback.message.edit_text(
         f"🛠 <b>Boshqaruv Paneli</b>\n\n"
