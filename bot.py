@@ -90,6 +90,11 @@ async def init_db():
             except Exception:
                 pass
 
+        # NULL qiymatlarni 0 ga to'g'irlash (reyting va hisob-kitoblar buzilmasligi uchun)
+        await db.execute("UPDATE users SET total_score = 0 WHERE total_score IS NULL")
+        await db.execute("UPDATE users SET posts_count = 0 WHERE posts_count IS NULL")
+        await db.execute("UPDATE users SET channel_posts_count = 0 WHERE channel_posts_count IS NULL")
+
         await db.commit()
 
 # ----------------- YORDAMCHI FUNKSIYALAR -----------------
@@ -197,7 +202,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO users (user_id, full_name, username) VALUES (?, ?, ?) "
+            "INSERT INTO users (user_id, full_name, username, total_score, posts_count, channel_posts_count) "
+            "VALUES (?, ?, ?, 0, 0, 0) "
             "ON CONFLICT(user_id) DO UPDATE SET full_name = excluded.full_name, username = excluded.username",
             (user.id, user.full_name, user.username)
         )
@@ -269,14 +275,15 @@ async def show_profile(message: types.Message, state: FSMContext):
     await state.clear()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT total_score, posts_count, channel_posts_count FROM users WHERE user_id = ?",
+            "SELECT COALESCE(total_score, 0), COALESCE(posts_count, 0), COALESCE(channel_posts_count, 0) "
+            "FROM users WHERE user_id = ?",
             (message.from_user.id,)
         )
         data = await cursor.fetchone()
 
     total_score = data[0] if data else 0
     posts_count = data[1] if data else 0
-    ch_posts_count = data[2] if data and len(data) > 2 and data[2] else 0
+    ch_posts_count = data[2] if data else 0
 
     await message.answer(
         f"👤 <b>Sizning profilingiz:</b>\n\n"
@@ -287,26 +294,32 @@ async def show_profile(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+# ----------------- TO'G'IRLANGAN TOP 10 REYTING -----------------
 @dp.message(F.text == "🏆 Top 10 Reyting")
 async def show_leaderboard(message: types.Message, state: FSMContext):
     await state.clear()
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT full_name, username, total_score, channel_posts_count FROM users "
-            "WHERE total_score > 0 OR channel_posts_count > 0 ORDER BY total_score DESC LIMIT 10"
-        )
+        # COALESCE orqali NULL qiymatlarni 0 ga aylantiramiz va to'g'ri saralaymiz
+        cursor = await db.execute("""
+            SELECT full_name, username, COALESCE(total_score, 0), COALESCE(channel_posts_count, 0)
+            FROM users
+            ORDER BY COALESCE(total_score, 0) DESC, COALESCE(channel_posts_count, 0) DESC
+            LIMIT 10
+        """)
         top_users = await cursor.fetchall()
 
-    if not top_users:
-        await message.answer("ℹ️ Hozircha reytingda hech kim yo'q.")
+    # Faqat 0 dan katta balli yoki kanal posti borlarni filtrlaymiz
+    active_top = [u for u in top_users if u[2] > 0 or u[3] > 0]
+
+    if not active_top:
+        await message.answer("ℹ️ Hozircha reytingda ball to'plagan ishtirokchilar mavjud emas.")
         return
 
     text = "🏆 <b>TOP-10 ishtirokchilar reytingi:</b>\n\n"
-    for idx, (name, uname, score, ch_count) in enumerate(top_users, start=1):
-        medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
+    for idx, (name, uname, score, ch_count) in enumerate(active_top, start=1):
+        medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"<b>{idx}.</b>"
         u_tag = f"(@{uname})" if uname else ""
-        ch_count = ch_count or 0
-        text += f"{medal} <b>{name}</b> {u_tag} — <b>{score} ⭐</b> | 📢 Kanalda: <b>{ch_count} ta</b>\n"
+        text += f"{medal} <b>{name}</b> {u_tag} — ⭐ <b>{score} ball</b> | 📢 Kanalda: <b>{ch_count} ta</b>\n"
 
     await message.answer(text, parse_mode="HTML")
 
@@ -330,7 +343,7 @@ async def process_search_user(message: types.Message, state: FSMContext):
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "SELECT full_name, username, total_score, posts_count, channel_posts_count "
+            "SELECT full_name, username, COALESCE(total_score, 0), COALESCE(posts_count, 0), COALESCE(channel_posts_count, 0) "
             "FROM users WHERE LOWER(username) = LOWER(?)",
             (query,)
         )
@@ -346,7 +359,6 @@ async def process_search_user(message: types.Message, state: FSMContext):
         return
 
     name, uname, score, p_cnt, ch_cnt = user_row
-    ch_cnt = ch_cnt or 0
     await message.answer(
         f"🔍 <b>Foydalanuvchi ma'lumotlari:</b>\n\n"
         f"👤 Ism: <b>{name}</b> (@{uname})\n"
@@ -393,7 +405,11 @@ async def list_all_participants(callback: types.CallbackQuery):
     if callback.from_user.id != SUPER_ADMIN_ID:
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT full_name, username, total_score, channel_posts_count FROM users ORDER BY total_score DESC")
+        cursor = await db.execute("""
+            SELECT full_name, username, COALESCE(total_score, 0), COALESCE(channel_posts_count, 0)
+            FROM users
+            ORDER BY COALESCE(total_score, 0) DESC
+        """)
         users = await cursor.fetchall()
 
     if not users:
@@ -403,7 +419,6 @@ async def list_all_participants(callback: types.CallbackQuery):
     text = "👥 <b>Barcha ishtirokchilar ro'yxati:</b>\n\n"
     for idx, (name, uname, score, ch_cnt) in enumerate(users, start=1):
         u_tag = f"(@{uname})" if uname else "(username yo'q)"
-        ch_cnt = ch_cnt or 0
         line = f"{idx}. <b>{name}</b> {u_tag} — ⭐ <b>{score} ball</b> | 📢 <b>{ch_cnt} ta</b> kanal posti\n"
         if len(text + line) > 4000:
             await callback.message.answer(text, parse_mode="HTML")
@@ -633,7 +648,6 @@ async def toggle_channel_btn(callback: types.CallbackQuery):
         await db.execute("UPDATE posts SET in_channel = ? WHERE id = ?", (new_val, post_id))
         await db.commit()
     
-    # Ball qo'yish tugmalari yo'qolib ketmaydi, kanalga chiqarish holati almashadi
     await callback.message.edit_reply_markup(reply_markup=get_admin_post_keyboard(post_id, in_channel=new_val))
     holat_matni = "Kanalga chiqarilishi belgilandi ✅" if new_val == 1 else "Kanalga chiqarish bekor qilindi ❌"
     await callback.answer(holat_matni)
@@ -656,7 +670,6 @@ async def start_rate_post(callback: types.CallbackQuery, state: FSMContext):
             return
         u_id, in_ch = post
 
-    # Ball va holatni FSM xotirasiga saqlab, admin/tekshiruvchidan izoh so'raymiz
     await state.update_data(
         eval_post_id=post_id,
         eval_user_id=u_id,
@@ -670,9 +683,9 @@ async def start_rate_post(callback: types.CallbackQuery, state: FSMContext):
     kanal_matni = " (Kanalga chiqariladi)" if in_ch == 1 else ""
 
     await callback.message.edit_text(
-        f"📝 <b>Post #{post_id} uchun qaror qabul qilindi:</b> {baholash_nomi}{kanal_matni}\n\n"
+        f"📝 <b>Post #{post_id} uchun qaror:</b> {baholash_nomi}{kanal_matni}\n\n"
         "💬 <b>Foydalanuvchiga izoh yozasizmi?</b>\n"
-        "Izohingizni yozib yuboring (yoki izohsiz jo'natish uchun <b>0</b> deb yozing):",
+        "Izohingizni yozing (yoki izohsiz yuborish uchun <b>0</b> deb yozing):",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -687,18 +700,17 @@ async def finish_evaluation_with_comment(message: types.Message, state: FSMConte
     u_id = data.get("eval_user_id")
     score = data.get("eval_score")
     in_ch = data.get("eval_in_channel")
-    admin_name = data.get("eval_admin_name")
 
     comment_text = message.text.strip()
     has_comment = comment_text != "0"
 
-    # Ma'lumotlar bazasini yangilash
     async with aiosqlite.connect(DB_PATH) as db:
         if score > 0:
             ch_add = 1 if in_ch == 1 else 0
             await db.execute(
-                "UPDATE users SET total_score = total_score + ?, posts_count = posts_count + 1, "
-                "channel_posts_count = channel_posts_count + ? WHERE user_id = ?",
+                "UPDATE users SET total_score = COALESCE(total_score, 0) + ?, "
+                "posts_count = COALESCE(posts_count, 0) + 1, "
+                "channel_posts_count = COALESCE(channel_posts_count, 0) + ? WHERE user_id = ?",
                 (score, ch_add, u_id)
             )
             await db.execute(
@@ -712,7 +724,6 @@ async def finish_evaluation_with_comment(message: types.Message, state: FSMConte
             )
         await db.commit()
 
-    # Foydalanuvchiga barcha natijani bitta qilib yetkazish
     user_msg = ""
     if score > 0:
         user_msg += f"🎉 <b>Postingiz tekshiruvdan o'tdi va qabul qilindi!</b>\n"
@@ -730,10 +741,9 @@ async def finish_evaluation_with_comment(message: types.Message, state: FSMConte
     except Exception as e:
         logging.error(f"Foydalanuvchiga yuborishda xatolik: {e}")
 
-    # Tekshiruvchiga tasdiqlash
     await message.answer(
-        f"✅ <b>Post #{post_id} muvaffaqiyatli baholandi va foydalanuvchiga barcha ma'lumot yetkazildi!</b>\n"
-        f"Baho: {score} ⭐ | Kanal: {'Ha' if in_ch == 1 else 'Yo‘q'} | Izoh: {'Mavjud' if has_comment else 'Yo‘q'}",
+        f"✅ <b>Post #{post_id} baholandi va natija foydalanuvchiga yetkazildi!</b>\n"
+        f"Baho: {score} ⭐ | Kanal: {'Ha' if in_ch == 1 else 'Yo‘q'}",
         parse_mode="HTML"
     )
     await state.clear()
